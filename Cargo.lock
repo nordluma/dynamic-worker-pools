@@ -610,6 +610,7 @@ dependencies = [
  "futures",
  "lapin",
  "lazy_static",
+ "rand 0.9.1",
  "sqlx",
  "tokio",
  "tracing",
