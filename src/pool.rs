@@ -40,5 +40,5 @@ pub enum PoolCommand {
     ScaleUp(usize),
     ScaleDown(usize),
     Shutdown,
-    ReportMetrics,
+    //ReportMetrics,
 }
