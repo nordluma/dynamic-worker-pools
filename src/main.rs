@@ -70,8 +70,13 @@ async fn main() -> Result<()> {
                     match scaling_action {
                         ScalingAction::ScaleUp(count) => {
                             info!(
-                                "Auto-scaling up pool {} by {} workers (queue_depth={}, utilization={}%)",
-                                queue_name, count, metrics.queue_depth, metrics.utilization
+                                "Auto-scaling up pool {} by {} workers (queue_depth={}, rate={:.2} msg/s, lag={}ms, util={}%)",
+                                queue_name,
+                                count,
+                                metrics.queue_depth,
+                                metrics.processing_rate,
+                                metrics.avg_processing_time_ms,
+                                metrics.utilization
                             );
                             if let Err(e) = manager_clone.scale_up(&queue_name, count).await {
                                 error!("Failed to scale up pool {}: {}", queue_name, e);
@@ -79,8 +84,13 @@ async fn main() -> Result<()> {
                         }
                         ScalingAction::ScaleDown(count) => {
                             info!(
-                                "Auto-scaling down pool {} by {} workers (queue_depth={}, utilization={}%)",
-                                queue_name, count, metrics.queue_depth, metrics.utilization
+                                "Auto-scaling down pool {} by {} workers (queue_depth={}, rate={:.2} msg/s, lag={}ms, util={}%)",
+                                queue_name,
+                                count,
+                                metrics.queue_depth,
+                                metrics.processing_rate,
+                                metrics.avg_processing_time_ms,
+                                metrics.utilization
                             );
                             if let Err(e) = manager_clone.scale_down(&queue_name, count).await {
                                 error!("Failed to scale down pool {}: {}", queue_name, e);
@@ -88,13 +98,14 @@ async fn main() -> Result<()> {
                         }
                         ScalingAction::NoChange => {
                             debug!(
-                                "No scaling needed for pool {}: queue_depth={}, workers={}/{}, utilization={}%, avg_process_time={}ms",
+                                "No scaling needed for pool {}: queue_depth={}, rate={:.2} msg/s, lag={}ms, workers={}/{}, util={}%",
                                 queue_name,
                                 metrics.queue_depth,
+                                metrics.processing_rate,
+                                metrics.avg_processing_time_ms,
                                 metrics.active_workers,
                                 metrics.max_workers,
                                 metrics.utilization,
-                                metrics.avg_processing_time_ms
                             );
                         }
                     }
