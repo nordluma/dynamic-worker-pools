@@ -609,6 +609,7 @@ dependencies = [
  "async-trait",
  "futures",
  "lapin",
+ "lazy_static",
  "sqlx",
  "tokio",
  "tracing",
