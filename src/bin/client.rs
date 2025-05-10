@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use lapin::{
     BasicProperties, Connection, ConnectionProperties,
     options::{BasicPublishOptions, BasicQosOptions},
@@ -14,27 +16,20 @@ async fn main() -> anyhow::Result<()> {
     let channel = connection.create_channel().await?;
     channel.basic_qos(10, BasicQosOptions::default()).await?;
 
-    // channel
-    //     .queue_bind(
-    //         "tasks",
-    //         "tasks",
-    //         "",
-    //         QueueBindOptions::default(),
-    //         FieldTable::default(),
-    //     )
-    //     .await?;
+    loop {
+        eprintln!("Sending a batch of messages");
+        for _ in 0..10 {
+            channel
+                .basic_publish(
+                    "",
+                    "tasks",
+                    BasicPublishOptions::default(),
+                    b"hello",
+                    BasicProperties::default(),
+                )
+                .await?;
+        }
 
-    for _ in 0..10 {
-        channel
-            .basic_publish(
-                "",
-                "tasks",
-                BasicPublishOptions::default(),
-                b"hello",
-                BasicProperties::default(),
-            )
-            .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-
-    Ok(())
 }
