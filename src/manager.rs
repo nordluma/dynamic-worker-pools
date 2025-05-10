@@ -54,23 +54,6 @@ impl WorkerPoolManager {
         })
     }
 
-    // Collect metrics about all worker pools
-    #[allow(unused)]
-    #[instrument(name = "WorkerPoolManager::collect_metrics", skip_all)]
-    pub async fn collect_metrics(&self) -> HashMap<String, (usize, usize)> {
-        let pools = self.pools.read().await;
-        let mut metrics = HashMap::new();
-
-        for (queue_name, pool) in pools.iter() {
-            metrics.insert(
-                queue_name.clone(),
-                (pool.active_workers, pool.config.max_workers),
-            );
-        }
-
-        metrics
-    }
-
     // Add a new worker pool
     #[instrument(
         name = "WorkerPoolManager::add_pool",
@@ -110,19 +93,8 @@ impl WorkerPoolManager {
         info!("Declared queue: {}", queue_name);
 
         // Initialize metrics for this pool
-        let initial_metrics = PoolMetrics {
-            active_workers: 0,
-            max_workers: config.max_workers,
-            processed_messages: 0,
-            failed_messages: 0,
-            avg_processing_time_ms: 0,
-            last_scale_time: Instant::now(),
-            queue_depth: queue_info.message_count(),
-            utilization: 0.0,
-            processed_messages_last_minute: 0,
-            processing_times: Vec::new(),
-            last_metrics_update: Instant::now(),
-        };
+        let message_count = queue_info.message_count();
+        let initial_metrics = PoolMetrics::new(config.max_workers, message_count);
 
         self.metrics
             .write()
@@ -130,7 +102,7 @@ impl WorkerPoolManager {
             .insert(queue_name.clone(), initial_metrics);
 
         // Initialize global metrics
-        init_metrics(&queue_name, config.max_workers);
+        init_metrics(&queue_name, config.max_workers, message_count);
 
         // Start metrics collection task
         let metrics_clone = self.metrics.clone();
@@ -144,9 +116,10 @@ impl WorkerPoolManager {
             connection_clone,
         ));
 
+        let config_clone = config.clone();
         // Start the pool manager task
         let pool_handle = tokio::spawn(Self::run_pool(
-            config.clone(),
+            config_clone,
             channel,
             worker_factory.clone(),
             command_rx,
@@ -156,11 +129,9 @@ impl WorkerPoolManager {
         // Store the pool
         let pool = WorkerPool {
             config,
-            //worker_factory: worker_factory.clone(),
             active_workers: 0,
             command_tx,
             _pool_handle: pool_handle,
-            //metrics_tx,
         };
 
         self.pools.write().await.insert(queue_name.clone(), pool);
@@ -170,6 +141,11 @@ impl WorkerPoolManager {
     }
 
     // Scale up a specific pool
+    #[instrument(
+        name = "WorkerPoolManager::scale_up",
+        skip_all,
+        fields(queue.name = queue_name, count)
+    )]
     pub async fn scale_up(&self, queue_name: &str, count: usize) -> Result<()> {
         let pools = self.pools.read().await;
 
@@ -189,6 +165,11 @@ impl WorkerPoolManager {
     }
 
     // Scale down a specific pool
+    #[instrument(
+        name = "WorkerPoolManager::scale_down",
+        skip_all,
+        fields(queue.name = queue_name, count)
+    )]
     pub async fn scale_down(&self, queue_name: &str, count: usize) -> Result<()> {
         let pools = self.pools.read().await;
 
@@ -266,8 +247,8 @@ impl WorkerPoolManager {
         queue_name: String,
         connection: Arc<Connection>,
     ) {
-        let mut total_processing_time = 0u64;
-        let mut processed_count = 0u64;
+        let mut total_processing_time = 0;
+        let mut processed_count = 0;
         let mut active_workers = 0usize;
 
         // Start a periodic task to refresh time-windowed metrics
@@ -291,23 +272,32 @@ impl WorkerPoolManager {
                 loop {
                     interval.tick().await;
 
-                    // First, get local metrics and update global metrics
-                    if let Some(local_metrics) = metrics_storage.read().await.get(&queue_name) {
-                        update_pool_metrics(&queue_name, local_metrics);
-                    }
+                    let current_metrics =
+                        { metrics_storage.read().await.get(&queue_name).cloned() };
 
-                    match get_queue_metrics(&queue_name).await {
+                    match get_queue_metrics(&queue_name, current_metrics.as_ref()).await {
                         Ok(queue_metrics) => {
                             // Update metrics with the collected data
                             if let Some(metrics) =
                                 metrics_storage.write().await.get_mut(&queue_name)
                             {
                                 metrics.queue_depth = queue_metrics.queue_depth;
-                                Span::current().record("workers.active", metrics.active_workers);
-
-                                // Update utilization based on the metrics from
-                                // RabbitMQ
                                 metrics.utilization = queue_metrics.utilization;
+
+                                // Update processing rate if we don't have our
+                                // own calculation
+                                if metrics.processing_rate == 0.0 {
+                                    metrics.processing_rate = queue_metrics.processing_rate;
+                                }
+
+                                // Update processing lag
+                                if metrics.avg_processing_time_ms == 0 {
+                                    metrics.avg_processing_time_ms =
+                                        queue_metrics.processing_lag_ms;
+                                }
+
+                                update_pool_metrics(&queue_name, metrics);
+                                Span::current().record("workers.active", metrics.active_workers);
                             }
                         }
                         Err(e) => {
@@ -340,10 +330,9 @@ impl WorkerPoolManager {
                                                     metrics.active_workers,
                                                 );
 
-                                                // Calculate utilization based on queue depth and worker count
+                                                // Recalculate utilization basd on queue depth
                                                 if metrics.active_workers > 0 {
                                                     if queue_depth > 0 {
-                                                        // Higher utilization when there are messages in the queue
                                                         metrics.utilization = f64::min(
                                                             100.0,
                                                             60.0 + (queue_depth as f64
@@ -351,7 +340,6 @@ impl WorkerPoolManager {
                                                                 * 20.0,
                                                         );
                                                     } else {
-                                                        // Lower utilization when queue is empty
                                                         metrics.utilization = 20.0;
                                                     }
                                                 }
@@ -387,24 +375,10 @@ impl WorkerPoolManager {
                     total_processing_time += processing_time_ms;
                     processed_count += 1;
 
-                    // Record in global metrics
                     record_message_processed(&queue_name, processing_time_ms);
-
-                    // Update metrics storage
+                    // Update metrics storage with processed message
                     if let Some(metrics) = metrics_storage.write().await.get_mut(&queue_name) {
-                        metrics.processed_messages += 1;
-                        metrics.avg_processing_time_ms = if processed_count > 0 {
-                            total_processing_time / processed_count
-                        } else {
-                            0
-                        };
-
-                        metrics.processing_times.push(processing_time_ms);
-                        if metrics.processing_times.len() > 100 {
-                            metrics.processing_times.remove(0);
-                        }
-
-                        metrics.processed_messages_last_minute += 1;
+                        metrics.add_processed_message(processing_time_ms);
                     }
                 }
                 WorkerMetric::MessageFailed => {
@@ -415,6 +389,7 @@ impl WorkerPoolManager {
                 WorkerMetric::WorkerStarted => {
                     active_workers += 1;
                     if let Some(metrics) = metrics_storage.write().await.get_mut(&queue_name) {
+                        info!("setting active workers to {active_workers}");
                         metrics.active_workers = active_workers;
                     }
                 }
@@ -435,6 +410,11 @@ impl WorkerPoolManager {
     }
 
     // Run a worker pool
+    #[instrument(
+        name = "WorkerPoolManager::run_pool",
+        skip_all,
+        fields(queue.name = config.queue_name)
+    )]
     async fn run_pool(
         config: WorkerPoolConfig,
         channel: Channel,
@@ -575,12 +555,6 @@ impl WorkerPoolManager {
 
                     break;
                 }
-
-                PoolCommand::ReportMetrics => {
-                    // Just for testing - report current worker count
-                    let worker_count = workers.read().await.len();
-                    info!("Pool {} currently has {} workers", queue_name, worker_count);
-                }
             }
         }
     }
@@ -621,55 +595,9 @@ impl WorkerPoolManager {
             let _ = metrics_tx.send(WorkerMetric::WorkerStarted).await;
             debug!("Started worker for queue {}", queue_name);
 
-            // Process messages
-            let mut consumer_stream = consumer.write().await.clone().into_stream();
+            let consumer = { consumer.write().await.clone() };
 
-            while let Some(delivery) = consumer_stream.next().await {
-                info!("received message");
-                match delivery {
-                    Ok(delivery) => {
-                        let delivery_tag = delivery.delivery_tag;
-                        let start_time = Instant::now();
-
-                        // Process the message
-                        match worker.process(delivery).await {
-                            Ok(_) => {
-                                let processing_time_ms = start_time.elapsed().as_millis() as u64;
-
-                                // Report successful processing with timing
-                                let _ = metrics_tx
-                                    .send(WorkerMetric::MessageProcessed { processing_time_ms })
-                                    .await;
-
-                                // Acknowledge the message
-                                if let Err(e) = channel
-                                    .basic_ack(delivery_tag, BasicAckOptions::default())
-                                    .await
-                                {
-                                    error!("Failed to acknowledge message: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to process message: {}", e);
-
-                                // Report failure
-                                let _ = metrics_tx.send(WorkerMetric::MessageFailed).await;
-
-                                // Negative acknowledge the message
-                                if let Err(e) = channel
-                                    .basic_nack(delivery_tag, BasicNackOptions::default())
-                                    .await
-                                {
-                                    error!("Failed to negative acknowledge message: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to receive message: {}", e);
-                    }
-                }
-            }
+            run_worker(worker, channel, consumer, metrics_tx.clone()).await;
 
             let _ = metrics_tx.send(WorkerMetric::WorkerStopped).await;
             debug!("Worker for queue {} exited", queue_name);
@@ -677,5 +605,61 @@ impl WorkerPoolManager {
 
         // Store the worker handle
         workers.write().await.push(handle);
+    }
+}
+
+#[instrument(name = "run_worker", skip_all)]
+async fn run_worker(
+    worker: Arc<dyn Worker>,
+    channel: Arc<Channel>,
+    consumer: Consumer,
+    metrics_tx: mpsc::Sender<WorkerMetric>,
+) {
+    let mut consumer_stream = consumer.into_stream();
+
+    while let Some(delivery) = consumer_stream.next().await {
+        match delivery {
+            Ok(delivery) => {
+                let delivery_tag = delivery.delivery_tag;
+                let start_time = Instant::now();
+
+                // Process the message
+                match worker.process(delivery).await {
+                    Ok(_) => {
+                        let processing_time_ms = start_time.elapsed().as_millis() as u64;
+
+                        // Report successful processing with timing
+                        let _ = metrics_tx
+                            .send(WorkerMetric::MessageProcessed { processing_time_ms })
+                            .await;
+
+                        // Acknowledge the message
+                        if let Err(e) = channel
+                            .basic_ack(delivery_tag, BasicAckOptions::default())
+                            .await
+                        {
+                            error!("Failed to acknowledge message: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to process message: {}", e);
+
+                        // Report failure
+                        let _ = metrics_tx.send(WorkerMetric::MessageFailed).await;
+
+                        // Negative acknowledge the message
+                        if let Err(e) = channel
+                            .basic_nack(delivery_tag, BasicNackOptions::default())
+                            .await
+                        {
+                            error!("Failed to negative acknowledge message: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to receive message: {}", e);
+            }
+        }
     }
 }
