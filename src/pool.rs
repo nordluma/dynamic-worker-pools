@@ -23,7 +23,7 @@ pub struct WorkerPool {
     //pub worker_factory: Arc<dyn Fn() -> Arc<dyn Worker> + Send + Sync>,
     pub active_workers: usize,
     pub command_tx: mpsc::Sender<PoolCommand>,
-    pub metrics_tx: mpsc::Sender<WorkerMetric>,
+    //pub metrics_tx: mpsc::Sender<WorkerMetric>,
     pub _pool_handle: JoinHandle<()>,
 }
 

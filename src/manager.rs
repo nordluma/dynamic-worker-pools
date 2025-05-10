@@ -24,7 +24,10 @@ use tokio::{
 use tracing::{Span, debug, error, info, instrument, warn};
 
 use crate::{
-    metrics::{PoolMetrics, get_queue_metrics},
+    metrics::{
+        PoolMetrics, get_queue_metrics, init_metrics, record_message_processed, refresh_metrics,
+        update_pool_metrics,
+    },
     pool::{PoolCommand, Worker, WorkerMetric, WorkerPool, WorkerPoolConfig},
 };
 
@@ -116,12 +119,18 @@ impl WorkerPoolManager {
             last_scale_time: Instant::now(),
             queue_depth: queue_info.message_count(),
             utilization: 0.0,
+            processed_messages_last_minute: 0,
+            processing_times: Vec::new(),
+            last_metrics_update: Instant::now(),
         };
 
         self.metrics
             .write()
             .await
             .insert(queue_name.clone(), initial_metrics);
+
+        // Initialize global metrics
+        init_metrics(&queue_name, config.max_workers);
 
         // Start metrics collection task
         let metrics_clone = self.metrics.clone();
@@ -151,7 +160,7 @@ impl WorkerPoolManager {
             active_workers: 0,
             command_tx,
             _pool_handle: pool_handle,
-            metrics_tx,
+            //metrics_tx,
         };
 
         self.pools.write().await.insert(queue_name.clone(), pool);
@@ -242,7 +251,7 @@ impl WorkerPoolManager {
         self.db_pool.clone()
     }
 
-    // Run metrics collector for a pool
+    /// Run metrics collector for a pool
     #[instrument(
         name = "WorkerPoolManager::run_metrics_collector",
         skip_all,
@@ -261,6 +270,16 @@ impl WorkerPoolManager {
         let mut processed_count = 0u64;
         let mut active_workers = 0usize;
 
+        // Start a periodic task to refresh time-windowed metrics
+        let refresh_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+            loop {
+                interval.tick().await;
+                refresh_metrics();
+            }
+        });
+
         // Periodically update queue depth from RabbitMQ
         let queue_depth_updater = {
             let metrics_storage = metrics_storage.clone();
@@ -271,6 +290,11 @@ impl WorkerPoolManager {
 
                 loop {
                     interval.tick().await;
+
+                    // First, get local metrics and update global metrics
+                    if let Some(local_metrics) = metrics_storage.read().await.get(&queue_name) {
+                        update_pool_metrics(&queue_name, local_metrics);
+                    }
 
                     match get_queue_metrics(&queue_name).await {
                         Ok(queue_metrics) => {
@@ -284,11 +308,6 @@ impl WorkerPoolManager {
                                 // Update utilization based on the metrics from
                                 // RabbitMQ
                                 metrics.utilization = queue_metrics.utilization;
-
-                                // Additionally, we could update other metrics
-                                // if needed For example, if we track processing
-                                // lag in our `PoolMetrics`
-                                metrics.avg_processing_time_ms = queue_metrics.processing_lag_ms
                             }
                         }
                         Err(e) => {
@@ -368,6 +387,9 @@ impl WorkerPoolManager {
                     total_processing_time += processing_time_ms;
                     processed_count += 1;
 
+                    // Record in global metrics
+                    record_message_processed(&queue_name, processing_time_ms);
+
                     // Update metrics storage
                     if let Some(metrics) = metrics_storage.write().await.get_mut(&queue_name) {
                         metrics.processed_messages += 1;
@@ -376,6 +398,13 @@ impl WorkerPoolManager {
                         } else {
                             0
                         };
+
+                        metrics.processing_times.push(processing_time_ms);
+                        if metrics.processing_times.len() > 100 {
+                            metrics.processing_times.remove(0);
+                        }
+
+                        metrics.processed_messages_last_minute += 1;
                     }
                 }
                 WorkerMetric::MessageFailed => {
@@ -400,8 +429,9 @@ impl WorkerPoolManager {
             }
         }
 
-        // Cancel queue depth updater when metrics collector exits
+        // Cancel updater tasks when metrics collector exits
         queue_depth_updater.abort();
+        refresh_task.abort();
     }
 
     // Run a worker pool
@@ -575,6 +605,7 @@ impl WorkerPoolManager {
         let sem = sem.clone();
         let consumer = consumer.clone();
         let channel = channel.clone();
+        let metrics_tx = metrics_tx.clone();
 
         // Spawn the worker task
         let handle = tokio::spawn(async move {
@@ -598,10 +629,18 @@ impl WorkerPoolManager {
                 match delivery {
                     Ok(delivery) => {
                         let delivery_tag = delivery.delivery_tag;
+                        let start_time = Instant::now();
 
                         // Process the message
                         match worker.process(delivery).await {
                             Ok(_) => {
+                                let processing_time_ms = start_time.elapsed().as_millis() as u64;
+
+                                // Report successful processing with timing
+                                let _ = metrics_tx
+                                    .send(WorkerMetric::MessageProcessed { processing_time_ms })
+                                    .await;
+
                                 // Acknowledge the message
                                 if let Err(e) = channel
                                     .basic_ack(delivery_tag, BasicAckOptions::default())
@@ -612,6 +651,10 @@ impl WorkerPoolManager {
                             }
                             Err(e) => {
                                 error!("Failed to process message: {}", e);
+
+                                // Report failure
+                                let _ = metrics_tx.send(WorkerMetric::MessageFailed).await;
+
                                 // Negative acknowledge the message
                                 if let Err(e) = channel
                                     .basic_nack(delivery_tag, BasicNackOptions::default())
@@ -628,6 +671,7 @@ impl WorkerPoolManager {
                 }
             }
 
+            let _ = metrics_tx.send(WorkerMetric::WorkerStopped).await;
             debug!("Worker for queue {} exited", queue_name);
         });
 
