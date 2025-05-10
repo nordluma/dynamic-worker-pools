@@ -1,12 +1,13 @@
 use std::{
     cmp::{max, min},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::RwLock,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use lapin::{Connection, ConnectionProperties, options::QueueDeclareOptions, types::FieldTable};
+use tracing::{Span, instrument};
 
 lazy_static::lazy_static! {
     pub static ref GLOBAL_METRICS: RwLock<HashMap<String, PoolMetrics>> = RwLock::new(HashMap::new());
@@ -20,47 +21,82 @@ pub struct PoolMetrics {
     pub utilization: f64,
     pub processed_messages: u64,
     pub processed_messages_last_minute: u64,
-    pub processing_times: Vec<u64>,
     pub last_scale_time: Instant,
     pub failed_messages: u64,
     pub avg_processing_time_ms: u64,
+    /// Messages processed per second
+    pub processing_rate: f64,
+    /// Time and processing duration for recent messages
+    pub message_history: VecDeque<(Instant, u64)>,
     pub last_metrics_update: Instant,
 }
 
 impl PoolMetrics {
-    pub fn new(max_workers: usize) -> Self {
+    pub fn new(max_workers: usize, queue_depth: u32) -> Self {
         Self {
             active_workers: 0,
             max_workers,
-            queue_depth: 0,
+            queue_depth,
             utilization: 0.0,
             processed_messages: 0,
             processed_messages_last_minute: 0,
-            processing_times: Vec::with_capacity(100), // Keep the last 100 processing times
             last_scale_time: Instant::now(),
             failed_messages: 0,
             avg_processing_time_ms: 0,
+            processing_rate: 0.0,
+            message_history: VecDeque::with_capacity(100), // Keep the last 100 processing times
             last_metrics_update: Instant::now(),
         }
     }
 
-    /// Update processing times and recalculate the average
-    pub fn add_processing_time(&mut self, time_ms: u64) {
-        self.processing_times.push(time_ms);
-
-        // Keep only the most recent 100 times
-        if self.processing_times.len() > 100 {
-            self.processing_times.remove(0);
+    /// Calculate processing rate based on message history
+    #[instrument(name = "PoolMetrics::update_processing_rate", skip_all)]
+    pub fn update_processing_rate(&mut self) {
+        // Remove messages older than 30 seconds
+        let cutoff = Instant::now() - Duration::from_secs(30);
+        while let Some((time, _)) = self.message_history.front() {
+            if *time < cutoff {
+                self.message_history.pop_front();
+            } else {
+                break;
+            }
         }
 
-        // Recalculate average
-        if !self.processing_times.is_empty() {
-            let sum: u64 = self.processing_times.iter().sum();
-            self.avg_processing_time_ms = sum / self.processing_times.len() as u64;
-        }
+        // Calculate messages per second based on recent history
+        if !self.message_history.is_empty() {
+            let oldest = self.message_history.front().unwrap().0;
+            let newest = self.message_history.back().unwrap().0;
+            let time_span = newest.duration_since(oldest).as_secs_f64();
 
+            if time_span > 0.0 {
+                self.processing_rate = self.message_history.len() as f64 / time_span;
+            }
+        } else {
+            self.processing_rate = 0.0;
+        }
+    }
+
+    /// Add processed message to history
+    #[instrument(name = "PoolMetrics::add_processed_message", skip_all)]
+    pub fn add_processed_message(&mut self, processing_time_ms: u64) {
         self.processed_messages += 1;
-        self.processed_messages_last_minute += 1;
+        self.message_history
+            .push_back((Instant::now(), processing_time_ms));
+
+        // Update running average of processing time
+        if self.avg_processing_time_ms == 0 {
+            self.avg_processing_time_ms = processing_time_ms;
+        } else {
+            // Weighted average - 80% old value, 20% new value
+            self.avg_processing_time_ms =
+                (self.avg_processing_time_ms * 4 + processing_time_ms) / 5;
+        }
+
+        // Update processing rate if it's been at least 5 seconds
+        if self.last_metrics_update.elapsed() > Duration::from_secs(5) {
+            self.update_processing_rate();
+            self.last_metrics_update = Instant::now();
+        }
     }
 
     /// Update metrics that need periodic refreshing
@@ -91,21 +127,26 @@ pub struct QueueMetrics {
 }
 
 /// Initialize global metrics
-pub fn init_metrics(queue_name: &str, max_workers: usize) {
+#[instrument(name = "init_metrics")]
+pub fn init_metrics(queue_name: &str, max_workers: usize, queue_depth: u32) {
     let mut metrics = GLOBAL_METRICS.write().unwrap();
-    metrics.insert(queue_name.to_string(), PoolMetrics::new(max_workers));
+    metrics.insert(
+        queue_name.to_string(),
+        PoolMetrics::new(max_workers, queue_depth),
+    );
 }
 
 /// Update global metrics when a message is processed
 pub fn record_message_processed(queue_name: &str, processing_time_ms: u64) {
     if let Ok(mut metrics) = GLOBAL_METRICS.write() {
         if let Some(pool_metrics) = metrics.get_mut(queue_name) {
-            pool_metrics.add_processing_time(processing_time_ms);
+            pool_metrics.add_processed_message(processing_time_ms);
         }
     }
 }
 
 // Periodically refresh time-windowed metrics
+#[instrument(name = "refresh_metrics")]
 pub fn refresh_metrics() {
     if let Ok(mut metrics) = GLOBAL_METRICS.write() {
         for (_, pool_metrics) in metrics.iter_mut() {
@@ -135,7 +176,11 @@ pub fn update_pool_metrics(queue_name: &str, metrics: &PoolMetrics) {
 }
 
 /// Get metrics for a specific queue from RabbitMQ
-pub async fn get_queue_metrics(queue_name: &str) -> Result<QueueMetrics> {
+#[instrument(name = "get_queue_metrics", skip_all, fields(queue.name = queue_name))]
+pub async fn get_queue_metrics(
+    queue_name: &str,
+    metrics: Option<&PoolMetrics>,
+) -> Result<QueueMetrics> {
     let connection = Connection::connect(
         "amqp://guest:guest@localhost:5672",
         ConnectionProperties::default(),
@@ -158,6 +203,52 @@ pub async fn get_queue_metrics(queue_name: &str) -> Result<QueueMetrics> {
 
     // Get queue depth (number of message waiting)
     let queue_depth = queue_info.message_count();
+
+    // Calculate real metrics from our pool metrics if available
+    // let (processing_rate, utilization, processing_lag_ms) = if let Some(metrics) = metrics {
+    //     // Calculate actual processing rate from our metrics
+    //     let rate = metrics.processing_rate;
+    //
+    //     // Calculate utilization
+    //     let utilization = if metrics.active_workers > 0 {
+    //         if queue_depth > 0 {
+    //             // Higher utilization when there are messages in the queue
+    //             f64::min(
+    //                 100.0,
+    //                 60.0 + (queue_depth as f64 / metrics.active_workers as f64) * 20.0,
+    //             )
+    //         } else {
+    //             // Lower utilization when queue is empty
+    //             20.0
+    //         }
+    //     } else {
+    //         0.0
+    //     };
+    //
+    //     let lag_ms = if rate > 0.0 {
+    //         ((queue_depth as f64 / rate) * 1000.0) as u64
+    //     } else if metrics.avg_processing_time_ms > 0 {
+    //         queue_depth as u64 * metrics.avg_processing_time_ms
+    //     } else {
+    //         0
+    //     };
+    //
+    //     (rate, utilization, lag_ms)
+    // } else {
+    //     // Fallback values when we don't have metrics
+    //     let processing_rate = 10.0; // Messages pre second per worker
+    //     let utilization = if queue_depth > 0 { 80.0 } else { 20.0 }; // Percentage
+    //     let processing_lag_ms = if queue_depth > 0 { 200 } else { 50 }; // Milliseconds
+    //
+    //     (processing_rate, utilization, processing_lag_ms)
+    // };
+    //
+    // Ok(QueueMetrics {
+    //     queue_depth,
+    //     processing_rate,
+    //     utilization,
+    //     processing_lag_ms,
+    // })
 
     // Step 1: Get metrics form our application tracking system
     // We'll need to access our metrics storage to get data without processed
@@ -321,75 +412,114 @@ fn estimate_processing_lag(queue_depth: u32) -> u64 {
 }
 
 /// Sophisticated adaptive scaling strategy that balances responsiveness with stability
+#[instrument(
+    name = "apply_adaptive_scaling_strategy",
+    skip_all,
+    fields(
+        queue.name = _queue_name,
+        queue.scaling_need = tracing::field::Empty,
+        queue.scaling_action = tracing::field::Empty
+    )
+)]
 pub fn apply_adaptive_scaling_strategy(_queue_name: &str, metrics: &PoolMetrics) -> ScalingAction {
     // Don't scale if we've scaled recently (cooldown period)
     if metrics.last_scale_time.elapsed() < Duration::from_secs(30) {
         return ScalingAction::NoChange;
     }
 
-    // Calculate metrics that matter for scaling
+    // Extract metrics
     let queue_depth = metrics.queue_depth;
     let active_workers = metrics.active_workers;
     let max_workers = metrics.max_workers;
+    let min_workers = 1; // Get from config
     let avg_process_time_ms = metrics.avg_processing_time_ms;
     let utilization = metrics.utilization;
+    let processing_rate = metrics.processing_rate;
 
-    // Calculate messages per worker
-    let messages_per_worker = if active_workers > 0 {
-        queue_depth as f64 / active_workers as f64
+    // Calculate processing capacity (messages/sec)
+    let processing_capacity = if avg_process_time_ms > 0 {
+        active_workers as f64 * (1000.0 / avg_process_time_ms as f64)
     } else {
-        queue_depth as f64 // Avoid division by zero
+        active_workers as f64 * 10.0 // Default assumption: 10 msgs/sec per worker
     };
 
-    // Calculate scaling need
+    // Calculate time to drain queue at current capacity
+    let time_to_drain_sec = if processing_rate > 0.0 {
+        queue_depth as f64 / processing_capacity
+    } else {
+        0.0
+    };
+
+    // Calculate projected queue depth in 1 minute based on current rate
+    let projected_growth_rate = processing_rate - processing_capacity;
+    let projected_queue_depth = queue_depth as f64 + (projected_growth_rate * 60.0);
+
     let scaling_need = calculate_scaling_need(
         queue_depth,
-        messages_per_worker,
+        processing_rate,
+        processing_capacity,
         utilization,
-        avg_process_time_ms,
+        time_to_drain_sec,
     );
+    Span::current().record("queue.scaling_need", tracing::field::debug(&scaling_need));
 
-    match scaling_need {
+    let scaling_action = match scaling_need {
         ScalingNeed::Critical => {
-            // Aggressive scaling for critical situations
-            let to_add = max(5, active_workers / 2); // Add 50% more workers or at least 5
-            ScalingAction::ScaleUp(min(to_add, max_workers - active_workers))
+            // Calculate number of workers needed based on processing rates
+            //
+            // Process projected queue in 30 seconds
+            let additional_capacity_needed = (projected_queue_depth / 30.0) as usize;
+            let ideal_workers = active_workers + additional_capacity_needed;
+
+            let to_add = min(ideal_workers - active_workers, max_workers);
+            if to_add > 0 {
+                ScalingAction::ScaleUp(to_add)
+            } else {
+                ScalingAction::NoChange
+            }
         }
         ScalingNeed::High => {
-            // Significant scaling
-            let to_add = max(3, active_workers / 4); // Add 25% more workers or at least 3
+            let to_add = max(3, active_workers / 4); // Add 25% more workers or atleast 3
             ScalingAction::ScaleUp(min(to_add, max_workers - active_workers))
         }
         ScalingNeed::Medium => {
-            // Moderate scaling
-            let to_add = max(2, active_workers / 10); // Add 10% more workers or at least 2
+            let to_add = max(2, active_workers / 10); // Add 10% more workers or atleast 2
             ScalingAction::ScaleUp(min(to_add, max_workers - active_workers))
         }
-        ScalingNeed::Low => {
-            // Minimal scaling
-            ScalingAction::ScaleUp(min(1, max_workers - active_workers))
-        }
-        ScalingNeed::Optimal => {
-            // No change needea
-            ScalingAction::NoChange
-        }
+        ScalingNeed::Low => ScalingAction::ScaleUp(min(1, max_workers - active_workers)),
+        ScalingNeed::Optimal => ScalingAction::NoChange,
         ScalingNeed::Underutilized => {
-            // Scale down slightly
-            if active_workers > 1 {
+            if active_workers > min_workers + 1 {
                 ScalingAction::ScaleDown(1)
             } else {
                 ScalingAction::NoChange
             }
         }
         ScalingNeed::HighlyUnderutilized => {
-            // Scale down more aggressively
-            let to_remove = max(2, active_workers / 10); // Remove 10% of workers or at least 2
-            ScalingAction::ScaleDown(to_remove)
+            if active_workers > min_workers + 2 {
+                let to_remove = max(2, active_workers / 10);
+                let target = active_workers - to_remove;
+                if target >= min_workers {
+                    ScalingAction::ScaleDown(to_remove)
+                } else {
+                    ScalingAction::ScaleDown(active_workers - min_workers)
+                }
+            } else {
+                ScalingAction::NoChange
+            }
         }
-    }
+    };
+
+    Span::current().record(
+        "queue.scaling_action",
+        tracing::field::debug(&scaling_action),
+    );
+
+    scaling_action
 }
 
 /// Scaling decision
+#[derive(Debug)]
 pub enum ScalingAction {
     ScaleUp(usize),
     ScaleDown(usize),
@@ -397,6 +527,7 @@ pub enum ScalingAction {
 }
 
 //b Calculate the scaling need based on various factors
+#[derive(Debug)]
 enum ScalingNeed {
     /// Need immediate aggressive scaling
     Critical,
@@ -428,41 +559,37 @@ impl PartialEq for ScalingAction {
 
 fn calculate_scaling_need(
     queue_depth: u32,
-    messages_per_worker: f64,
+    processing_rate: f64,
+    processing_capacity: f64,
     utilization: f64,
-    avg_process_time_ms: u64,
+    time_to_drain_sec: f64,
+    //avg_process_time_ms: u64,
 ) -> ScalingNeed {
-    // Define thresholds based on your workload characteristics
-    if queue_depth > 500 || (queue_depth > 200 && avg_process_time_ms > 1000) {
-        // Very high queue depth or high queue with slow processing
-        return ScalingNeed::Critical;
-    }
+    // Calculate projected queue depth in 1 minute based on current rate
+    let projected_growth_rate = processing_rate - processing_capacity;
+    let projected_queue_depth = queue_depth as f64 + (projected_growth_rate * 60.0);
 
-    if queue_depth > 200 || (queue_depth > 100 && messages_per_worker > 20.0) {
-        // High queue depth or medium queue with high per-worker load
-        return ScalingNeed::High;
+    if projected_queue_depth > 500.0 || time_to_drain_sec > 180.0 {
+        // Queue will be very large in 1 minute or it would take > 3 minutes to
+        // drain
+        ScalingNeed::Critical
+    } else if projected_queue_depth > 200.0 || time_to_drain_sec > 120.0 {
+        // Queue will be large or it would take > 2 minutes to drain
+        ScalingNeed::High
+    } else if projected_queue_depth > 50.0 || time_to_drain_sec > 60.0 {
+        // Queue will be large or it would take > 1 minute to drain
+        ScalingNeed::Medium
+    } else if queue_depth > 10 && utilization > 70.0 {
+        // Current conditions indicate some scaling needed
+        ScalingNeed::Low
+    } else if projected_queue_depth < 0.0 && queue_depth < 5 && utilization < 20.0 {
+        // Queue is projected to empty and utilization is low
+        ScalingNeed::HighlyUnderutilized
+    } else if projected_queue_depth < 5.0 && utilization < 40.0 {
+        // Queue is projected to remain low and utilization is moderate
+        ScalingNeed::Underutilized
+    } else {
+        // Current scaling seems appropriate
+        ScalingNeed::Optimal
     }
-
-    if queue_depth > 50 || (utilization > 80.0 && queue_depth > 20) {
-        // Medium queue depth or high utilization with some queue buildup
-        return ScalingNeed::Medium;
-    }
-
-    if queue_depth > 10 && utilization > 70.0 {
-        // Small queue with high utilization
-        return ScalingNeed::Low;
-    }
-
-    if queue_depth < 5 && utilization < 20.0 {
-        // Very low queue and utilization
-        return ScalingNeed::HighlyUnderutilized;
-    }
-
-    if queue_depth < 10 && utilization < 40.0 {
-        // Low queue and utilization
-        return ScalingNeed::Underutilized;
-    }
-
-    // Default - current scaling is fine
-    ScalingNeed::Optimal
 }
