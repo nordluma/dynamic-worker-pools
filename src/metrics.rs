@@ -6,14 +6,19 @@ use std::{
 use anyhow::Result;
 use lapin::{Connection, ConnectionProperties, options::QueueDeclareOptions, types::FieldTable};
 
-// Example main function showing usage
-// Queue metrics used for scaling decisions
-#[allow(unused)]
-struct QueueMetrics {
-    pub queue_depth: u32,       // Number of messages in queue
-    pub processing_rate: f64,   // Messages processed per second
-    pub utilization: f64,       // Worker utilization percentage
-    pub processing_lag_ms: u64, // Average processing time per message in ms
+/// Queue metrics used for scaling decisions
+pub struct QueueMetrics {
+    /// Number of messages in queue
+    pub queue_depth: u32,
+
+    /// Messages processed per second
+    pub processing_rate: f64,
+
+    /// Worker utilization percentage
+    pub utilization: f64,
+
+    /// Average processing time per message in ms
+    pub processing_lag_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -28,16 +33,8 @@ pub struct PoolMetrics {
     pub avg_processing_time_ms: u64,
 }
 
-// Implement various scaling strategies
-
-// Get metrics for a specific queue from RabbitMQ
-#[allow(unused)]
-async fn get_queue_metrics(queue_name: &str) -> Result<QueueMetrics> {
-    // In a real implementation, you would:
-    // 1. Connect to RabbitMQ management API or use your connection to get queue statistics
-    // 2. Query your own metrics collection system if you have one
-
-    // This is a simplified example that connects directly to RabbitMQ
+/// Get metrics for a specific queue from RabbitMQ
+pub async fn get_queue_metrics(queue_name: &str) -> Result<QueueMetrics> {
     let connection = Connection::connect(
         "amqp://guest:guest@localhost:5672",
         ConnectionProperties::default(),
@@ -79,7 +76,7 @@ async fn get_queue_metrics(queue_name: &str) -> Result<QueueMetrics> {
     })
 }
 
-// Sophisticated adaptive scaling strategy that balances responsiveness with stability
+/// Sophisticated adaptive scaling strategy that balances responsiveness with stability
 pub fn apply_adaptive_scaling_strategy(_queue_name: &str, metrics: &PoolMetrics) -> ScalingAction {
     // Don't scale if we've scaled recently (cooldown period)
     if metrics.last_scale_time.elapsed() < Duration::from_secs(30) {

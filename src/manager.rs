@@ -24,7 +24,7 @@ use tokio::{
 use tracing::{Span, debug, error, info, instrument, warn};
 
 use crate::{
-    metrics::PoolMetrics,
+    metrics::{PoolMetrics, get_queue_metrics},
     pool::{PoolCommand, Worker, WorkerMetric, WorkerPool, WorkerPoolConfig},
 };
 
@@ -272,56 +272,88 @@ impl WorkerPoolManager {
                 loop {
                     interval.tick().await;
 
-                    // Get current queue depth
-                    match connection.create_channel().await {
-                        Ok(channel) => {
-                            match channel
-                                .queue_declare(
-                                    &queue_name,
-                                    QueueDeclareOptions {
-                                        passive: true,
-                                        ..QueueDeclareOptions::default()
-                                    },
-                                    FieldTable::default(),
-                                )
-                                .await
+                    match get_queue_metrics(&queue_name).await {
+                        Ok(queue_metrics) => {
+                            // Update metrics with the collected data
+                            if let Some(metrics) =
+                                metrics_storage.write().await.get_mut(&queue_name)
                             {
-                                Ok(queue_info) => {
-                                    let queue_depth = queue_info.message_count();
+                                metrics.queue_depth = queue_metrics.queue_depth;
+                                Span::current().record("workers.active", metrics.active_workers);
 
-                                    // Update metrics
-                                    if let Some(metrics) =
-                                        metrics_storage.write().await.get_mut(&queue_name)
+                                // Update utilization based on the metrics from
+                                // RabbitMQ
+                                metrics.utilization = queue_metrics.utilization;
+
+                                // Additionally, we could update other metrics
+                                // if needed For example, if we track processing
+                                // lag in our `PoolMetrics`
+                                metrics.avg_processing_time_ms = queue_metrics.processing_lag_ms
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to get queue metrics for {queue_name}: {e}");
+
+                            // Get current queue depth
+                            match connection.create_channel().await {
+                                Ok(channel) => {
+                                    match channel
+                                        .queue_declare(
+                                            &queue_name,
+                                            QueueDeclareOptions {
+                                                passive: true,
+                                                ..QueueDeclareOptions::default()
+                                            },
+                                            FieldTable::default(),
+                                        )
+                                        .await
                                     {
-                                        metrics.queue_depth = queue_depth;
-                                        Span::current()
-                                            .record("workers.active", metrics.active_workers);
+                                        Ok(queue_info) => {
+                                            let queue_depth = queue_info.message_count();
 
-                                        // Calculate utilization based on queue depth and worker count
-                                        if metrics.active_workers > 0 {
-                                            if queue_depth > 0 {
-                                                // Higher utilization when there are messages in the queue
-                                                metrics.utilization = f64::min(
-                                                    100.0,
-                                                    60.0 + (queue_depth as f64
-                                                        / metrics.active_workers as f64)
-                                                        * 20.0,
+                                            // Update metrics
+                                            if let Some(metrics) =
+                                                metrics_storage.write().await.get_mut(&queue_name)
+                                            {
+                                                metrics.queue_depth = queue_depth;
+                                                Span::current().record(
+                                                    "workers.active",
+                                                    metrics.active_workers,
                                                 );
-                                            } else {
-                                                // Lower utilization when queue is empty
-                                                metrics.utilization = 20.0;
+
+                                                // Calculate utilization based on queue depth and worker count
+                                                if metrics.active_workers > 0 {
+                                                    if queue_depth > 0 {
+                                                        // Higher utilization when there are messages in the queue
+                                                        metrics.utilization = f64::min(
+                                                            100.0,
+                                                            60.0 + (queue_depth as f64
+                                                                / metrics.active_workers as f64)
+                                                                * 20.0,
+                                                        );
+                                                    } else {
+                                                        // Lower utilization when queue is empty
+                                                        metrics.utilization = 20.0;
+                                                    }
+                                                }
                                             }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to get queue info for {}: {}",
+                                                queue_name, e
+                                            );
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Failed to get queue info for {}: {}", queue_name, e);
+                                    error!(
+                                        "Failed to create channel for metrics collection: {}",
+                                        e
+                                    );
+                                    sleep(Duration::from_secs(5)).await;
                                 }
                             }
-                        }
-                        Err(e) => {
-                            error!("Failed to create channel for metrics collection: {}", e);
-                            sleep(Duration::from_secs(5)).await;
                         }
                     }
                 }
@@ -417,7 +449,7 @@ impl WorkerPoolManager {
                 &sem,
                 consumer.clone(),
                 channel.clone(),
-                //metrics_tx.clone(),
+                metrics_tx.clone(),
             )
             .await;
         }
@@ -448,7 +480,7 @@ impl WorkerPoolManager {
                                 &sem,
                                 consumer.clone(),
                                 channel.clone(),
-                                //metrics_tx.clone(),
+                                metrics_tx.clone(),
                             )
                             .await;
                         }
@@ -523,7 +555,12 @@ impl WorkerPoolManager {
         }
     }
 
-    // Spawn a new worker
+    /// Spawn a new worker
+    #[instrument(
+        name = "WorkerPoolManager::spawn_worker",
+        skip_all,
+        fields(queue.name = queue_name)
+    )]
     async fn spawn_worker(
         queue_name: &str,
         worker_factory: &Arc<dyn Fn() -> Arc<dyn Worker> + Send + Sync>,
@@ -531,6 +568,7 @@ impl WorkerPoolManager {
         sem: &Arc<Semaphore>,
         consumer: Arc<RwLock<Consumer>>,
         channel: Arc<Channel>,
+        metrics_tx: mpsc::Sender<WorkerMetric>,
     ) {
         let queue_name = queue_name.to_string();
         let worker = worker_factory();
@@ -549,6 +587,7 @@ impl WorkerPoolManager {
                 }
             };
 
+            let _ = metrics_tx.send(WorkerMetric::WorkerStarted).await;
             debug!("Started worker for queue {}", queue_name);
 
             // Process messages
