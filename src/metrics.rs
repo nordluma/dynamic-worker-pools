@@ -179,7 +179,7 @@ pub fn update_pool_metrics(queue_name: &str, metrics: &PoolMetrics) {
 #[instrument(name = "get_queue_metrics", skip_all, fields(queue.name = queue_name))]
 pub async fn get_queue_metrics(
     queue_name: &str,
-    metrics: Option<&PoolMetrics>,
+    _metrics: Option<&PoolMetrics>,
 ) -> Result<QueueMetrics> {
     let connection = Connection::connect(
         "amqp://guest:guest@localhost:5672",
