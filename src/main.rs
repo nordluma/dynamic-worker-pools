@@ -3,6 +3,7 @@ use db_worker::DbWorker;
 use manager::WorkerPoolManager;
 use metrics::{ScalingAction, apply_adaptive_scaling_strategy};
 use pool::WorkerPoolConfig;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info};
@@ -45,108 +46,113 @@ async fn main() -> Result<()> {
 
     // Start a background task to monitor load and scale pools
     let manager_clone = manager.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-
-        loop {
-            interval.tick().await;
-
-            // Get metrics for all pools
-            let pool_names: Vec<String> = {
-                let pools = manager_clone.pools.read().await;
-                pools.keys().cloned().collect()
-            };
-
-            // Process each pool
-            for queue_name in pool_names {
-                // Get internal metrics
-                let pool_metrics = { manager_clone.metrics.read().await.get(&queue_name).cloned() };
-
-                if let Some(metrics) = pool_metrics {
-                    // Apply adaptive scaling strategy
-                    let scaling_action = apply_adaptive_scaling_strategy(&queue_name, &metrics);
-
-                    // Apply the scaling decision
-                    match scaling_action {
-                        ScalingAction::ScaleUp(count) => {
-                            info!(
-                                "Auto-scaling up pool {} by {} workers (queue_depth={}, rate={:.2} msg/s, lag={}ms, util={}%)",
-                                queue_name,
-                                count,
-                                metrics.queue_depth,
-                                metrics.processing_rate,
-                                metrics.avg_processing_time_ms,
-                                metrics.utilization
-                            );
-                            if let Err(e) = manager_clone.scale_up(&queue_name, count).await {
-                                error!("Failed to scale up pool {}: {}", queue_name, e);
-                            }
-                        }
-                        ScalingAction::ScaleDown(count) => {
-                            info!(
-                                "Auto-scaling down pool {} by {} workers (queue_depth={}, rate={:.2} msg/s, lag={}ms, util={}%)",
-                                queue_name,
-                                count,
-                                metrics.queue_depth,
-                                metrics.processing_rate,
-                                metrics.avg_processing_time_ms,
-                                metrics.utilization
-                            );
-                            if let Err(e) = manager_clone.scale_down(&queue_name, count).await {
-                                error!("Failed to scale down pool {}: {}", queue_name, e);
-                            }
-                        }
-                        ScalingAction::NoChange => {
-                            debug!(
-                                "No scaling needed for pool {}: queue_depth={}, rate={:.2} msg/s, lag={}ms, workers={}/{}, util={}%",
-                                queue_name,
-                                metrics.queue_depth,
-                                metrics.processing_rate,
-                                metrics.avg_processing_time_ms,
-                                metrics.active_workers,
-                                metrics.max_workers,
-                                metrics.utilization,
-                            );
-                        }
-                    }
-
-                    // Update last scale time in metrics if needed
-                    if scaling_action != ScalingAction::NoChange {
-                        if let Some(metrics) =
-                            manager_clone.metrics.write().await.get_mut(&queue_name)
-                        {
-                            metrics.last_scale_time = Instant::now();
-                        }
-                    }
-                }
-            }
-        }
-    });
+    tokio::spawn(handle_pool_scaling(manager_clone));
 
     // Setup separate thread for database reads
     let db_pool = manager.db_pool();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-
-        loop {
-            interval.tick().await;
-
-            // Get a connection from the pool
-            // Read from the database
-            let count = sqlx::query!("SELECT COUNT(*) as count FROM messages")
-                .fetch_one(db_pool.as_ref())
-                .await
-                .map(|row| row.count);
-
-            if let Ok(count) = count {
-                info!("Current message count: {}", count);
-            }
-        }
-    });
+    tokio::spawn(query_row_count(db_pool));
 
     // Keep the application running
     tokio::signal::ctrl_c().await?;
     info!("Shutting down");
 
     Ok(())
+}
+
+async fn handle_pool_scaling(manager: Arc<WorkerPoolManager>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+
+        // Get metrics for all pools
+        let pool_names: Vec<String> = {
+            let pools = manager.pools.read().await;
+            pools.keys().cloned().collect()
+        };
+
+        // Process each pool
+        for queue_name in pool_names {
+            // Get internal metrics
+            let pool_metrics = { manager.metrics.read().await.get(&queue_name).cloned() };
+
+            if let Some(metrics) = pool_metrics {
+                // Apply adaptive scaling strategy
+                let scaling_action = apply_adaptive_scaling_strategy(&queue_name, &metrics);
+
+                // Apply the scaling decision
+                match scaling_action {
+                    ScalingAction::ScaleUp(count) => {
+                        info!(
+                            "Auto-scaling up pool {} by {} workers (queue_depth={}, rate={:.2} msg/s, lag={}ms, util={}%)",
+                            queue_name,
+                            count,
+                            metrics.queue_depth,
+                            metrics.processing_rate,
+                            metrics.avg_processing_time_ms,
+                            metrics.utilization
+                        );
+                        if let Err(e) = manager.scale_up(&queue_name, count).await {
+                            error!("Failed to scale up pool {}: {}", queue_name, e);
+                        }
+                    }
+                    ScalingAction::ScaleDown(count) => {
+                        info!(
+                            "Auto-scaling down pool {} by {} workers (queue_depth={}, rate={:.2} msg/s, lag={}ms, util={}%)",
+                            queue_name,
+                            count,
+                            metrics.queue_depth,
+                            metrics.processing_rate,
+                            metrics.avg_processing_time_ms,
+                            metrics.utilization
+                        );
+                        if let Err(e) = manager.scale_down(&queue_name, count).await {
+                            error!("Failed to scale down pool {}: {}", queue_name, e);
+                        }
+                    }
+                    ScalingAction::NoChange => {
+                        debug!(
+                            "No scaling needed for pool {}: queue_depth={}, rate={:.2} msg/s, lag={}ms, workers={}/{}, util={}%",
+                            queue_name,
+                            metrics.queue_depth,
+                            metrics.processing_rate,
+                            metrics.avg_processing_time_ms,
+                            metrics.active_workers,
+                            metrics.max_workers,
+                            metrics.utilization,
+                        );
+                    }
+                }
+
+                // Update last scale time in metrics if needed
+                if scaling_action != ScalingAction::NoChange {
+                    if let Some(metrics) = manager.metrics.write().await.get_mut(&queue_name) {
+                        metrics.last_scale_time = Instant::now();
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn query_row_count(db_pool: Arc<SqlitePool>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+
+    loop {
+        interval.tick().await;
+
+        // Get a connection from the pool
+        // Read from the database
+        let res =
+            sqlx::query!("DELETE FROM messages WHERE created_at < datetime('now', '-5 minutes')")
+                .execute(db_pool.as_ref())
+                .await;
+
+        if let Ok(res) = res {
+            let rows_affected = res.rows_affected();
+            if rows_affected > 0 {
+                info!("deleted {} messages", rows_affected);
+            }
+        }
+    }
 }
