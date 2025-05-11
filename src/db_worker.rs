@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use lapin::message::Delivery;
 use rand::{random_bool, random_range};
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Sqlite, SqlitePool};
 use tracing::{debug, info, instrument};
 
 use crate::pool::Worker;
@@ -39,5 +39,27 @@ impl Worker for DbWorker {
             .await?;
 
         Ok(())
+    }
+}
+
+pub async fn delete_old_messages(db_pool: Arc<SqlitePool>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+
+    loop {
+        interval.tick().await;
+
+        // Get a connection from the pool
+        // Read from the database
+        let res =
+            sqlx::query!("DELETE FROM messages WHERE created_at < datetime('now', '-5 minutes')")
+                .execute(db_pool.as_ref())
+                .await;
+
+        if let Ok(res) = res {
+            let rows_affected = res.rows_affected();
+            if rows_affected > 0 {
+                info!("deleted {} messages", rows_affected);
+            }
+        }
     }
 }

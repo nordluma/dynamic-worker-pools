@@ -1,9 +1,8 @@
 use anyhow::Result;
-use db_worker::DbWorker;
+use db_worker::{DbWorker, delete_old_messages};
 use manager::WorkerPoolManager;
 use metrics::{ScalingAction, apply_adaptive_scaling_strategy};
 use pool::WorkerPoolConfig;
-use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info};
@@ -13,7 +12,6 @@ mod manager;
 mod metrics;
 mod pool;
 
-// Example main function showing usage
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -45,12 +43,10 @@ async fn main() -> Result<()> {
         .await?;
 
     // Start a background task to monitor load and scale pools
-    let manager_clone = manager.clone();
-    tokio::spawn(handle_pool_scaling(manager_clone));
+    tokio::spawn(handle_pool_scaling(manager.clone()));
 
-    // Setup separate thread for database reads
-    let db_pool = manager.db_pool();
-    tokio::spawn(query_row_count(db_pool));
+    // Setup separate thread for database queries
+    tokio::spawn(delete_old_messages(manager.db_pool()));
 
     // Keep the application running
     tokio::signal::ctrl_c().await?;
@@ -130,28 +126,6 @@ async fn handle_pool_scaling(manager: Arc<WorkerPoolManager>) {
                         metrics.last_scale_time = Instant::now();
                     }
                 }
-            }
-        }
-    }
-}
-
-async fn query_row_count(db_pool: Arc<SqlitePool>) {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-
-    loop {
-        interval.tick().await;
-
-        // Get a connection from the pool
-        // Read from the database
-        let res =
-            sqlx::query!("DELETE FROM messages WHERE created_at < datetime('now', '-5 minutes')")
-                .execute(db_pool.as_ref())
-                .await;
-
-        if let Ok(res) = res {
-            let rows_affected = res.rows_affected();
-            if rows_affected > 0 {
-                info!("deleted {} messages", rows_affected);
             }
         }
     }
