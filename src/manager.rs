@@ -291,10 +291,9 @@ impl WorkerPoolManager {
                                 }
 
                                 // Update processing lag
-                                if metrics.avg_processing_time_ms == 0 {
-                                    metrics.avg_processing_time_ms =
-                                        queue_metrics.processing_lag_ms;
-                                }
+                                // if metrics.avg_processing_time_ms == 0 {
+                                metrics.avg_processing_time_ms = queue_metrics.processing_lag_ms;
+                                // }
 
                                 update_pool_metrics(&queue_name, metrics);
                                 Span::current().record("workers.active", metrics.active_workers);
@@ -391,6 +390,7 @@ impl WorkerPoolManager {
                     if let Some(metrics) = metrics_storage.write().await.get_mut(&queue_name) {
                         info!("setting active workers to {active_workers}");
                         metrics.active_workers = active_workers;
+                        Span::current().record("workers.active", active_workers);
                     }
                 }
                 WorkerMetric::WorkerStopped => {
